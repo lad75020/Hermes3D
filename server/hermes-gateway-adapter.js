@@ -26,6 +26,10 @@ const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const { WebSocketServer } = require("ws");
+const {
+  loadAdapterState,
+  saveAdapterState,
+} = require("./hermes-adapter-state");
 
 function loadDotenvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -196,7 +200,7 @@ const TEAM_TOOLS = [
 ];
 
 // ---------------------------------------------------------------------------
-// In-memory state
+// Runtime state
 // ---------------------------------------------------------------------------
 
 /** @type {Map<string, Array<{role: string, content: string}>>} */
@@ -237,11 +241,42 @@ const agentRegistry = new Map([
 const activeSendEventFns = new Set();
 
 // ---------------------------------------------------------------------------
-// Disk persistence for conversation history
+// Disk persistence
 // ---------------------------------------------------------------------------
 
 const HISTORY_FILE = path.join(HOME, ".hermes", "hermes3d-history.json");
+const ADAPTER_STATE_FILE = path.join(HOME, ".hermes", "hermes3d-adapter-state.json");
 let persistDebounceTimer = null;
+
+function adapterStateOptions() {
+  return {
+    stateFile: ADAPTER_STATE_FILE,
+    agentRegistry,
+    agentFiles,
+    sessionSettings,
+    cronJobs,
+    protectedAgentId: AGENT_ID,
+  };
+}
+
+function loadAdapterStateFromDisk() {
+  try {
+    const restored = loadAdapterState(adapterStateOptions());
+    if (restored.loaded) {
+      console.log(
+        `[hermes-adapter] Loaded adapter state: ${restored.agents} agent(s), `
+        + `${restored.files} file(s), ${restored.sessions} session setting(s), `
+        + `${restored.cronJobs} cron job(s).`
+      );
+    }
+  } catch (err) {
+    console.warn("[hermes-adapter] Could not load adapter state:", sanitizeErrorMessage(err));
+  }
+}
+
+function saveAdapterStateToDisk() {
+  saveAdapterState(adapterStateOptions());
+}
 
 function loadHistoryFromDisk() {
   try {
@@ -582,6 +617,7 @@ async function execSpawnAgent(args) {
     id: newId, name, workspace: `${HOME}/.hermes/workspace-${slug}`,
     role, systemPrompt, settings: { wipe, continuity, model, boundaries },
   });
+  saveAdapterStateToDisk();
 
   console.log(`[hermes-adapter] Spawned agent: ${name} (${newId})`);
 
@@ -685,6 +721,7 @@ function execConfigureAgent(args) {
     }
   }
   if (typeof args.model === "string" && args.model.trim()) agent.settings.model = args.model.trim();
+  saveAdapterStateToDisk();
   console.log(`[hermes-adapter] Configured agent: ${agent.name} (${targetId})`);
   broadcastEvent({
     type: "event", event: "presence",
@@ -708,6 +745,7 @@ function execDismissAgent(args) {
   if (!agent) return JSON.stringify({ ok: false, error: `Agent ${targetId} not found` });
   agentRegistry.delete(targetId);
   clearHistory(`agent:${targetId}:${MAIN_KEY}`);
+  saveAdapterStateToDisk();
   console.log(`[hermes-adapter] Dismissed agent: ${agent.name} (${targetId})`);
   return JSON.stringify({ ok: true, dismissed: targetId });
 }
@@ -851,14 +889,16 @@ async function handleMethod(method, params, id, sendEvent) {
         role: "", systemPrompt: `You are ${agentName}.`,
         settings: { wipe: false, continuity: true, model: HERMES_MODEL },
       });
+      saveAdapterStateToDisk();
       return resOk(id, { agentId: newId, name: agentName, workspace });
     }
 
     case "agents.delete": {
       const delId = typeof p.agentId === "string" ? p.agentId : "";
       if (delId && delId !== AGENT_ID) {
-        agentRegistry.delete(delId);
+        const removed = agentRegistry.delete(delId);
         clearHistory(`agent:${delId}:${MAIN_KEY}`);
+        if (removed) saveAdapterStateToDisk();
       }
       return resOk(id, { ok: true, removedBindings: 0 });
     }
@@ -870,6 +910,7 @@ async function handleMethod(method, params, id, sendEvent) {
         if (typeof p.name === "string" && p.name.trim()) existing.name = p.name.trim();
         if (typeof p.workspace === "string" && p.workspace.trim()) existing.workspace = p.workspace.trim();
         if (typeof p.role === "string") existing.role = p.role.trim();
+        saveAdapterStateToDisk();
       }
       return resOk(id, { ok: true, removedBindings: 0 });
     }
@@ -883,6 +924,7 @@ async function handleMethod(method, params, id, sendEvent) {
     case "agents.files.set": {
       const key = `${p.agentId || AGENT_ID}/${p.name || ""}`;
       agentFiles.set(key, typeof p.content === "string" ? p.content : "");
+      saveAdapterStateToDisk();
       return resOk(id, {});
     }
 
@@ -942,6 +984,7 @@ async function handleMethod(method, params, id, sendEvent) {
       if (p.execSecurity !== undefined) next.execSecurity = p.execSecurity;
       if (p.execAsk !== undefined) next.execAsk = p.execAsk;
       sessionSettings.set(key, next);
+      saveAdapterStateToDisk();
       const resolvedModel = await resolveHermesModel(next.model || HERMES_MODEL);
       return resOk(id, { ok: true, key, entry: { thinkingLevel: next.thinkingLevel },
         resolved: { model: resolvedModel, modelProvider: "hermes" } });
@@ -1126,12 +1169,15 @@ async function handleMethod(method, params, id, sendEvent) {
         payload: p.payload || { kind: "systemEvent", text: "tick" }, state: {},
       };
       cronJobs.set(jobId, job);
+      saveAdapterStateToDisk();
       return resOk(id, job);
     }
 
     case "cron.remove": {
       const jobId = typeof p.id === "string" ? p.id : "";
-      return resOk(id, { ok: true, removed: cronJobs.delete(jobId) });
+      const removed = cronJobs.delete(jobId);
+      if (removed) saveAdapterStateToDisk();
+      return resOk(id, { ok: true, removed });
     }
 
     case "cron.patch": {
@@ -1145,6 +1191,7 @@ async function handleMethod(method, params, id, sendEvent) {
       if (p.payload !== undefined) updated.payload = p.payload;
       updated.updatedAtMs = Date.now();
       cronJobs.set(jobId, updated);
+      saveAdapterStateToDisk();
       return resOk(id, { ok: true, job: updated });
     }
 
@@ -1153,11 +1200,17 @@ async function handleMethod(method, params, id, sendEvent) {
       const job = cronJobs.get(jobId);
       if (!job) return resOk(id, { ok: false });
       cronJobs.set(jobId, { ...job, state: { ...job.state, runningAtMs: Date.now() } });
+      saveAdapterStateToDisk();
       setTimeout(() => {
         const current = cronJobs.get(jobId);
         if (!current) return;
         const done = { ...current, state: { ...current.state, runningAtMs: undefined, lastRunAtMs: Date.now(), lastStatus: "ok" } };
         cronJobs.set(jobId, done);
+        try {
+          saveAdapterStateToDisk();
+        } catch (err) {
+          console.warn("[hermes-adapter] Could not save completed cron state:", sanitizeErrorMessage(err));
+        }
         broadcastEvent({ type: "event", event: "cron", payload: { action: "finished", jobId, status: "ok", summary: done } });
       }, 3000);
       return resOk(id, { ok: true, ran: true });
@@ -1276,4 +1329,5 @@ function startAdapter() {
 }
 
 loadHistoryFromDisk();
+loadAdapterStateFromDisk();
 startAdapter();
