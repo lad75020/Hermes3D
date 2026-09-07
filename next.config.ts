@@ -1,6 +1,11 @@
 import type { NextConfig } from "next";
 import path from "node:path";
 
+// The Studio is loopback-only when this flag is used by the Hermes Desktop
+// LaunchAgent. Electron's renderer has a separate origin, so the standard
+// same-origin anti-framing policy would reject the embedded office.
+const allowDesktopEmbedding = process.env.HERMES3D_EMBEDDED === "true";
+
 const securityHeaders = [
   {
     key: "Content-Security-Policy",
@@ -8,7 +13,7 @@ const securityHeaders = [
       "default-src 'self'",
       "base-uri 'self'",
       "form-action 'self'",
-      "frame-ancestors 'self'",
+      allowDesktopEmbedding ? "frame-ancestors *" : "frame-ancestors 'self'",
       "img-src 'self' data: blob: http: https:",
       "font-src 'self' data: https:",
       "style-src 'self' 'unsafe-inline' https:",
@@ -35,10 +40,16 @@ const securityHeaders = [
     key: "X-Content-Type-Options",
     value: "nosniff",
   },
-  {
-    key: "X-Frame-Options",
-    value: "SAMEORIGIN",
-  },
+  // X-Frame-Options has no safe cross-origin allowlist. The CSP above is the
+  // modern framing control; omit this legacy header only for loopback Desktop.
+  ...(allowDesktopEmbedding
+    ? []
+    : [
+        {
+          key: "X-Frame-Options",
+          value: "SAMEORIGIN",
+        },
+      ]),
   {
     key: "Permissions-Policy",
     value: "camera=(), microphone=(self), geolocation=(), browsing-topics=()",
